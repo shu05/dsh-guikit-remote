@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GUI Kit Remote (Windows)",
+    "description": "Windows desktop control when dsh runs on another machine: the 13 dsh-guikit tools execute on the remote Windows box through the windows-mcp PowerShell channel, screenshots are pulled back over scp, and gui_vision answers questions about the screen using the GPU of the host (the controlled Windows machine) or the server (the machine running dsh)."
+  }
+}

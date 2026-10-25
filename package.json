@@ -1,0 +1,50 @@
+{
+  "name": "dsh-guikit-remote",
+  "description": "DSH GUI Toolkit REMOTE — Windows desktop control when the dsh host runs on another machine. The 13 dsh-guikit tools execute on the remote Windows box through the windows-mcp PowerShell channel (streamable-http MCP), screenshots are fetched over scp, and gui_vision answers questions about the screen using the GPU of the host (the controlled Windows machine) or the server (the machine running dsh).",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "NOTICE"
+  ],
+  "license": "Apache-2.0",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "gui",
+    "automation",
+    "remote-desktop",
+    "computer-use",
+    "windows",
+    "uiautomation",
+    "vision",
+    "gpu"
+  ]
+}

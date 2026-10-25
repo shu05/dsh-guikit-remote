@@ -1,0 +1,45 @@
+# dsh-guikit-remote bundle patch — inserts the remote GUI toolkit plugin.
+# Defaults below are for this deployment (dsh on the Linux server, Windows box
+# "ph" at 192.168.0.240). Override any of it in the profile's cordis.patch.yml.
+#
+#   mcp.url / mcp.token  — windows-mcp streamable-http endpoint (interactive
+#                          session; the only channel that can see the desktop).
+#                          Token comes from WIN_MCP_KEY in $DSH_HOME/.env.
+#   ssh.*                — scp channel used ONLY to pull screenshot PNGs back
+#                          to the server (SSH-spawned processes cannot touch
+#                          the desktop, but they transfer files fine).
+#   gate.maxWaitMs       — how long a tool waits out the windows-mcp
+#                          desktop-gate while the user is at the machine.
+#   vision.gpu           — which video card runs gui_vision inference:
+#                          "host"   = the controlled Windows machine (its GPU),
+#                          "server" = the machine running dsh (its GPU).
+#   vision.host / .server — OpenAI-compatible endpoints per backend.
+- insert:
+    - id: dsh-guikit-remote
+      name: dsh-guikit-remote
+      config:
+        mcp:
+          url: http://192.168.0.240:8000/mcp
+          token: !!js process.env.WIN_MCP_KEY || ''
+        ssh:
+          host: 192.168.0.240
+          user: admin
+          port: 22
+        gate:
+          maxWaitMs: 120000
+        vision:
+          gpu: server
+          host:
+            baseUrl: http://192.168.0.240:11434/v1
+            model: qwen3-vl:2b-instruct
+            apiKey: ollama
+            timeoutMs: 120000
+          server:
+            baseUrl: http://127.0.0.1:11434/v1
+            model: qwen3-vl:2b-instruct
+            apiKey: local
+            timeoutMs: 120000
+            manage: true
+            strataUrl: http://127.0.0.1:8193
+            reserveMib: 5120
+            unloadMs: 120000

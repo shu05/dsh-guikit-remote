@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GUI Kit Remote (Windows)",
+    "description": "Управление рабочим столом Windows, когда dsh запущен на другой машине: тулзы выполняются на удалённой Windows через PowerShell-канал windows-mcp, скриншоты забираются по scp, а gui_vision отвечает на вопросы об экране видеокартой хоста (управляемая Windows) или сервера (машина с dsh)."
+  }
+}

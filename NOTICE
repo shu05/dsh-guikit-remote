@@ -1,0 +1,16 @@
+dsh-guikit-remote
+=================
+
+This plugin is a derivative work of **dsh-guikit** v0.6.2
+(https://github.com/gezi-wen/dsh-guikit), Copyright (c) gezi-wen,
+licensed under the Apache License, Version 2.0.
+
+The PowerShell execution layer (P/Invoke helpers, UIA walkers, screenshot
+rulers and the coordinate-space contract) is inherited from dsh-guikit.
+This fork replaces the local `pwsh` subprocess execution with remote
+execution through the windows-mcp streamable-http MCP server
+(https://github.com/CursorTouch/Windows-MCP) plus scp screenshot transfer,
+and adds the `gui_vision` tool with a host/server GPU switch.
+
+Both upstream projects are credited above; no other third-party artwork is
+included (icon.svg is original).
