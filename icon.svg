@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="scr" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2a4a"/>
+      <stop offset="1" stop-color="#0f1a30"/>
+    </linearGradient>
+  </defs>
+  <!-- remote Windows monitor -->
+  <rect x="22" y="8" width="36" height="26" rx="3" fill="url(#scr)" stroke="#4f8cff" stroke-width="2"/>
+  <rect x="36" y="34" width="8" height="6" fill="#4f8cff"/>
+  <rect x="28" y="40" width="24" height="3" rx="1.5" fill="#4f8cff"/>
+  <!-- eye on the screen: vision -->
+  <path d="M28 21 Q40 10 52 21 Q40 32 28 21 Z" fill="none" stroke="#7ce38b" stroke-width="2"/>
+  <circle cx="40" cy="21" r="4" fill="#7ce38b"/>
+  <circle cx="40" cy="21" r="1.6" fill="#0f1a30"/>
+  <!-- server box (dsh host) -->
+  <rect x="4" y="38" width="16" height="18" rx="2" fill="#233150" stroke="#8fb4ff" stroke-width="2"/>
+  <line x1="7" y1="43" x2="17" y2="43" stroke="#8fb4ff" stroke-width="1.6"/>
+  <line x1="7" y1="47" x2="17" y2="47" stroke="#8fb4ff" stroke-width="1.6"/>
+  <circle cx="15.2" cy="52" r="1.4" fill="#7ce38b"/>
+  <!-- wireless link server -> monitor -->
+  <path d="M20 40 Q14 24 24 18" fill="none" stroke="#ffb454" stroke-width="2" stroke-dasharray="3 3"/>
+  <path d="M24 18 l-4.5 -1.2 l2.6 4.2 z" fill="#ffb454"/>
+</svg>
