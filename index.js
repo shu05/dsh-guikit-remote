@@ -305,7 +305,7 @@ const DAEMON_PS = [
   "  if ($op -eq 'drag') { return [U32]::Drag([int]$p.fx, [int]$p.fy, [int]$p.tx, [int]$p.ty, [string]$p.button, [int]$p.steps, [int]$p.stepDelayMs) }",
   "  if ($op -eq 'scroll') { return [U32]::ScrollAt([int]$p.x, [int]$p.y, [int]$p.notches, [string]$p.direction) }",
   "  if ($op -eq 'type') { return [U32]::TypeText([string]$p.text) }",
-  "  if ($op -eq 'key') { $vk = @($p.vks | ForEach-Object { [ushort]$_ }); return [U32]::TapKeys($vk) }",
+  "  if ($op -eq 'key') { return [U32]::TapKeys([System.UInt16[]]@($p.vks)) }",
   "  if ($op -eq 'move') { if ([U32]::SetCursorPos([int]$p.x, [int]$p.y)) { return 'ok' } else { return 'SetCursorPos failed' } }",
   "  if ($op -eq 'activate') { return [U32]::Activate([IntPtr][int64]$p.handle) }",
   '  throw ("unknown op: " + $op)',
