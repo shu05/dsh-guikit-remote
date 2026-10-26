@@ -8,8 +8,16 @@
 #   ssh.*                — scp channel used ONLY to pull screenshot PNGs back
 #                          to the server (SSH-spawned processes cannot touch
 #                          the desktop, but they transfer files fine).
-#   gate.maxWaitMs       — how long a tool waits out the windows-mcp
-#                          desktop-gate while the user is at the machine.
+#   gate.maxWaitMs       — how long a tool waits out the desktop-gate while the
+#                          user is at the machine (both windows-mcp and daemon).
+#   daemon.*             — resident PowerShell microserver on 127.0.0.1:port,
+#                          reached through a persistent `ssh -N -L` tunnel.
+#                          Kills the per-call PowerShell spawn (~0.4s) and the
+#                          scp round-trip for screenshots; click/key + auto
+#                          screenshot land in ONE round trip. enabled:false
+#                          forces the windows-mcp path for everything.
+#                          gateIdleMs: user-idle threshold before the daemon
+#                          accepts input; idleExitMin: daemon auto-exit.
 #   vision.gpu           — which video card runs gui_vision inference:
 #                          "host"   = the controlled Windows machine (its GPU),
 #                          "server" = the machine running dsh (its GPU).
@@ -27,8 +35,14 @@
           port: 22
         gate:
           maxWaitMs: 120000
+        daemon:
+          enabled: true
+          port: 18742
+          gateIdleMs: 1500
+          idleExitMin: 15
+          jpegQuality: 80
         vision:
-          gpu: server
+          gpu: host
           host:
             baseUrl: http://192.168.0.240:11434/v1
             model: qwen3-vl:2b-instruct

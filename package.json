@@ -1,7 +1,7 @@
 {
   "name": "dsh-guikit-remote",
   "description": "DSH GUI Toolkit REMOTE — Windows desktop control when the dsh host runs on another machine. The 13 dsh-guikit tools execute on the remote Windows box through the windows-mcp PowerShell channel (streamable-http MCP), screenshots are fetched over scp, and gui_vision answers questions about the screen using the GPU of the host (the controlled Windows machine) or the server (the machine running dsh).",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "./index.js",
   "exports": {

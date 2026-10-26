@@ -32,8 +32,8 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
-import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -202,6 +202,232 @@ const PRELUDE = [
   '  }',
   '}',
   '[U32]::SetProcessDPIAware() | Out-Null',
+].join('\n')
+
+// ---- 常驻守护进程（热路径）------------------------------------------------------------------
+// windows-mcp 每次调用都要 spawn PowerShell（实测 ~0.4s），截图还要 scp 回传（握手 ~0.5s）。
+// 守护进程 = 常驻微 HTTP 服务器（TcpListener 绑 127.0.0.1，非管理员无需 urlacl），宿主经
+// 持久 SSH 隧道访问：不 spawn、不握手，动作+自动截图一次往返完成。上传与启动一次性走
+// windows-mcp（Start-Process hidden → 进程落在用户交互会话，能截屏能送输入）。
+// 协议：GET /ping；POST /shot /act /wait /quit（JSON in/out，图像 base64）。
+// 桌面门控用 GetLastInputInfo：idle < gateIdleMs → 423 USER_CONTROL，宿主按 wait_seconds 重试。
+// 空闲 idleExitMin 分钟自动退出，下次调用宿主重新上传启动。守护进程不可用时一切回退 MCP 路径。
+const DAEMON_PS = [
+  '# $args: [0]=port [1]=token [2]=idleExitMin [3]=gateIdleMs',
+  '$DPort = [int]$args[0]; if ($DPort -le 0) { $DPort = 18742 }',
+  '$DKey = [string]$args[1]',
+  '$DIdleMin = 15; if ($args[2]) { $DIdleMin = [double]$args[2] }',
+  '$DGateIdle = 1500; if ($args[3]) { $DGateIdle = [int]$args[3] }',
+  "try { [IO.File]::WriteAllText((Join-Path $ARTDIR 'dshgkd.key'), $DKey) } catch {}",
+  'Add-Type -AssemblyName UIAutomationClient',
+  'Add-Type -AssemblyName UIAutomationTypes',
+  "Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public static class DG{[StructLayout(LayoutKind.Sequential)]public struct LII{public uint cbSize;public uint dwTime;}[DllImport(\"user32.dll\")]public static extern bool GetLastInputInfo(ref LII p);public static double IdleMs(){LII l=new LII();l.cbSize=(uint)Marshal.SizeOf(l);if(!GetLastInputInfo(ref l))return 9e15;return (double)(Environment.TickCount-(int)l.dwTime);}}'",
+  'function D-Json($o) { return ($o | ConvertTo-Json -Compress -Depth 8) }',
+  'function D-Send($ns, $code, $status, $ctype, $bytes) {',
+  '  $h = "HTTP/1.1 $code $status`r`nContent-Type: $ctype`r`nContent-Length: " + $bytes.Length + "`r`nConnection: close`r`n`r`n"',
+  '  $hb = [Text.Encoding]::ASCII.GetBytes($h); $ns.Write($hb, 0, $hb.Length); if ($bytes.Length -gt 0) { $ns.Write($bytes, 0, $bytes.Length) }; $ns.Flush()',
+  '}',
+  "function D-SendJson($ns, $code, $status, $o) { D-Send $ns $code $status 'application/json; charset=utf-8' ([Text.Encoding]::UTF8.GetBytes((D-Json $o))) }",
+  'function D-Downscale($bmp, $maxDim) {',
+  '  if ($maxDim -le 0) { return ,$bmp }',
+  '  $m = [Math]::Max($bmp.Width, $bmp.Height); if ($m -le $maxDim) { return ,$bmp }',
+  '  $sc = [double]$maxDim / $m',
+  '  $nw = [int][Math]::Round($bmp.Width * $sc); $nh = [int][Math]::Round($bmp.Height * $sc)',
+  '  $rb = New-Object System.Drawing.Bitmap($nw, $nh)',
+  '  $rg = [System.Drawing.Graphics]::FromImage($rb)',
+  '  $rg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic',
+  '  $rg.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality',
+  '  $rg.DrawImage($bmp, 0, 0, $nw, $nh); $rg.Dispose(); $bmp.Dispose()',
+  '  return ,$rb',
+  '}',
+  'function D-Enc($bmp, $fmt, $q) {',
+  '  $ms = New-Object System.IO.MemoryStream',
+  "  if ($fmt -eq 'jpg') {",
+  '    $codec = $null',
+  '    foreach ($ci in [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders()) { if ($ci.MimeType -eq "image/jpeg") { $codec = $ci; break } }',
+  '    $ep = New-Object System.Drawing.Imaging.EncoderParameters 1',
+  '    $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]$q)',
+  '    $bmp.Save($ms, $codec, $ep)',
+  '  } else { $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png) }',
+  '  $b = $ms.ToArray(); $ms.Dispose(); return ,$b',
+  '}',
+  'function D-Cap($p) {',
+  '  $x = 0; $y = 0; $w = 0; $h = 0; $bmp = $null',
+  '  if ($p.handle) {',
+  '    $vh = [IntPtr][int64]$p.handle',
+  '    $vr = New-Object RECT',
+  '    if (-not [U32]::GetWindowRect($vh, [ref]$vr)) { throw "window rect failed" }',
+  '    $w = $vr.Right - $vr.Left; $h = $vr.Bottom - $vr.Top',
+  '    if ($w -lt 1 -or $h -lt 1 -or $w -gt 8000 -or $h -gt 4000) { throw "window has no usable rect (it may have closed)" }',
+  '    $bmp = New-Object System.Drawing.Bitmap($w, $h)',
+  '    $vg = [System.Drawing.Graphics]::FromImage($bmp); $hdc = $vg.GetHdc()',
+  '    try { $ok = [U32]::PrintWindow($vh, $hdc, 2) } finally { $vg.ReleaseHdc($hdc) }',
+  '    if (-not $ok) { $vg.CopyFromScreen($vr.Left, $vr.Top, 0, 0, (New-Object System.Drawing.Size($w, $h))) }',
+  '    $vg.Dispose(); $x = $vr.Left; $y = $vr.Top',
+  '  } elseif ($null -ne $p.x -and $null -ne $p.y) {',
+  '    $x = [int]$p.x; $y = [int]$p.y; $w = [int]$p.w; $h = [int]$p.h',
+  '    if ($w -lt 1 -or $h -lt 1 -or $w -gt 8000 -or $h -gt 4000) { throw "bad region" }',
+  '    $bmp = New-Object System.Drawing.Bitmap($w, $h)',
+  '    $vg = [System.Drawing.Graphics]::FromImage($bmp); $vg.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($w, $h))); $vg.Dispose()',
+  '  } elseif ($null -ne $p.screen) {',
+  '    $sb2 = [System.Windows.Forms.Screen]::AllScreens[[int]$p.screen].Bounds',
+  '    $x = $sb2.X; $y = $sb2.Y; $w = $sb2.Width; $h = $sb2.Height',
+  '    $bmp = New-Object System.Drawing.Bitmap($w, $h)',
+  '    $vg = [System.Drawing.Graphics]::FromImage($bmp); $vg.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($w, $h))); $vg.Dispose()',
+  '  } else {',
+  '    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen',
+  '    $x = $vs.X; $y = $vs.Y; $w = $vs.Width; $h = $vs.Height',
+  '    $bmp = New-Object System.Drawing.Bitmap($w, $h)',
+  '    $vg = [System.Drawing.Graphics]::FromImage($bmp); $vg.CopyFromScreen($x, $y, 0, 0, $vs.Size); $vg.Dispose()',
+  '  }',
+  '  return @{ bmp = $bmp; x = $x; y = $y; w = $w; h = $h }',
+  '}',
+  'function D-ShotJson($p) {',
+  "  $c = D-Cap $p",
+  '  $fmt = "png"; if ($p.fmt) { $fmt = [string]$p.fmt }',
+  '  $q = 80; if ($p.q) { $q = [int]$p.q }',
+  '  $md = 0; if ($p.maxDim) { $md = [int]$p.maxDim }',
+  '  $bmp = D-Downscale $c.bmp $md',
+  '  $outW = $bmp.Width; $outH = $bmp.Height',
+  '  $bytes = D-Enc $bmp $fmt $q',
+  '  $bmp.Dispose()',
+  '  return @{ b64 = [Convert]::ToBase64String($bytes); fmt = $fmt; x = $c.x; y = $c.y; w = $c.w; h = $c.h; out_w = $outW; out_h = $outH; scale = [double]$outW / $c.w }',
+  '}',
+  'function D-FindWindow($sub) {',
+  '  $vc = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)',
+  '  $ws = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $vc)',
+  '  foreach ($w2 in $ws) { try { if ($w2.Current.Name -like ("*" + [string]$sub + "*")) { return [int64]$w2.Current.NativeWindowHandle } } catch {} }',
+  '  return $null',
+  '}',
+  'function D-Act($p) {',
+  "  $op = [string]$p.op",
+  "  if ($op -eq 'click') { return [U32]::Click([int]$p.x, [int]$p.y, [string]$p.button, [int]$p.clicks) }",
+  "  if ($op -eq 'drag') { return [U32]::Drag([int]$p.fx, [int]$p.fy, [int]$p.tx, [int]$p.ty, [string]$p.button, [int]$p.steps, [int]$p.stepDelayMs) }",
+  "  if ($op -eq 'scroll') { return [U32]::ScrollAt([int]$p.x, [int]$p.y, [int]$p.notches, [string]$p.direction) }",
+  "  if ($op -eq 'type') { return [U32]::TypeText([string]$p.text) }",
+  "  if ($op -eq 'key') { $vk = @($p.vks | ForEach-Object { [ushort]$_ }); return [U32]::TapKeys($vk) }",
+  "  if ($op -eq 'move') { if ([U32]::SetCursorPos([int]$p.x, [int]$p.y)) { return 'ok' } else { return 'SetCursorPos failed' } }",
+  "  if ($op -eq 'activate') { return [U32]::Activate([IntPtr][int64]$p.handle) }",
+  '  throw ("unknown op: " + $op)',
+  '}',
+  'function D-Wait($p) {',
+  '  $t0 = Get-Date',
+  '  $timeout = 10000; if ($p.timeoutMs) { $timeout = [double]$p.timeoutMs }; if ($timeout -gt 55000) { $timeout = 55000 }',
+  '  $interval = 150; if ($p.intervalMs) { $interval = [Math]::Max(80, [double]$p.intervalMs) }',
+  '  $met = $false; $detail = "timeout"; $obs = $null; $base = $null',
+  "  $mode = [string]$p.mode",
+  '  while ($true) {',
+  "    if ($mode -eq 'pixel') {",
+  '      $b1 = New-Object System.Drawing.Bitmap(1, 1)',
+  '      $g1 = [System.Drawing.Graphics]::FromImage($b1)',
+  '      $g1.CopyFromScreen([int]$p.x, [int]$p.y, 0, 0, (New-Object System.Drawing.Size(1, 1))); $g1.Dispose()',
+  '      $col = $b1.GetPixel(0, 0); $b1.Dispose()',
+  '      $obs = @($col.R, $col.G, $col.B)',
+  '      if ($null -ne $p.r) {',
+  '        $same = (($col.R -eq [int]$p.r) -and ($col.G -eq [int]$p.g) -and ($col.B -eq [int]$p.b))',
+  "        if ($p.compare -eq 'neq') { $met = -not $same } else { $met = $same }",
+  '        if ($met) { $detail = "pixel matched" }',
+  '      } else {',
+  '        if ($null -eq $base) { $base = $obs }',
+  '        elseif (-not ($base[0] -eq $obs[0] -and $base[1] -eq $obs[1] -and $base[2] -eq $obs[2])) { $met = $true; $detail = "pixel changed" }',
+  '      }',
+  "    } elseif ($mode -eq 'window') {",
+  '      $hh = D-FindWindow ([string]$p.title)',
+  '      $met = ($null -ne $hh); $obs = $hh',
+  '      if ($met) { $detail = "window found" }',
+  "    } else { throw 'wait mode must be pixel|window' }",
+  '    $el = [int](((Get-Date) - $t0).TotalMilliseconds)',
+  '    if ($met -or $el -ge $timeout) { return @{ met = $met; elapsedMs = $el; detail = $detail; observed = $obs } }',
+  '    Start-Sleep -Milliseconds ([int]$interval)',
+  '  }',
+  '}',
+  'function D-Handle($ns, $method, $path, $bodyTxt) {',
+  "  if ($method -eq 'GET' -and $path -eq '/ping') { D-SendJson $ns 200 'OK' @{ ok = $true; pid = $PID; idleMs = [int][DG]::IdleMs() }; return }",
+  "  if ($path -eq '/quit') { D-SendJson $ns 200 'OK' @{ bye = $true }; $script:DRun = $false; return }",
+  '  $p = $null',
+  '  if ($bodyTxt) { $p = $bodyTxt | ConvertFrom-Json } else { $p = New-Object PSObject }',
+  "  if ($path -eq '/shot') {",
+  '    if ($p.window) { $fh = D-FindWindow ([string]$p.window); if ($null -eq $fh) { D-SendJson $ns 200 "OK" @{ error = "window not found" }; return }; $p | Add-Member -Force NoteProperty handle $fh }',
+  '    D-SendJson $ns 200 "OK" (D-ShotJson $p)',
+  '    return',
+  '  }',
+  "  if ($path -eq '/act') {",
+  '    $res = D-Act $p',
+  '    $settle = 0; if ($p.settleMs) { $settle = [int]$p.settleMs }; if ($settle -gt 3000) { $settle = 3000 }',
+  '    if ($settle -gt 0) { Start-Sleep -Milliseconds $settle }',
+  '    $j = [ordered]@{ result = $res }',
+  '    $cp = New-Object POINT; [void][U32]::GetCursorPos([ref]$cp)',
+  '    $j.cursor = @{ x = $cp.x; y = $cp.y }',
+  '    $j.fg = [U32]::FgTitle()',
+  '    if ($p.shot) {',
+  "      $sp = [PSCustomObject]@{ fmt = 'jpg'; q = 80; maxDim = 2000 }",
+  '      if ($p.shot -is [System.Management.Automation.PSCustomObject]) { $sp = $p.shot }',
+  '      $j.shot = D-ShotJson $sp',
+  '    }',
+  '    D-SendJson $ns 200 "OK" $j',
+  '    return',
+  '  }',
+  "  if ($path -eq '/wait') { D-SendJson $ns 200 'OK' (D-Wait $p); return }",
+  "  D-SendJson $ns 404 'Not Found' @{ error = ('no route: ' + $path) }",
+  '}',
+  '$script:DRun = $true',
+  'try {',
+  '  $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $DPort)',
+  '  $listener.Start()',
+  '  $lastReq = Get-Date',
+  '  while ($script:DRun) {',
+  '    if (-not $listener.Pending()) { Start-Sleep -Milliseconds 150; if (((Get-Date) - $lastReq).TotalMinutes -gt $DIdleMin) { break }; continue }',
+  '    $client = $null; $ns = $null',
+  '    try {',
+  '      $client = $listener.AcceptTcpClient()',
+  '      $client.NoDelay = $true',
+  '      $ns = $client.GetStream(); $ns.ReadTimeout = 20000; $ns.WriteTimeout = 20000',
+  '      $ms = New-Object System.IO.MemoryStream',
+  '      $buf = New-Object byte[] 8192',
+  '      $headEnd = -1; $headTxt = ""',
+  '      while ($headEnd -lt 0) {',
+  '        $n = $ns.Read($buf, 0, $buf.Length)',
+  '        if ($n -le 0) { break }',
+  '        $ms.Write($buf, 0, $n)',
+  '        $s = [Text.Encoding]::ASCII.GetString($ms.ToArray())',
+  '        $idx = $s.IndexOf("`r`n`r`n")',
+  '        if ($idx -ge 0) { $headEnd = $idx + 4; $headTxt = $s.Substring(0, $idx) }',
+  '      }',
+  '      if ($headEnd -lt 0) { continue }',
+  '      $clen = 0',
+  '      foreach ($line in ($headTxt -split "`r`n")) { if ($line -imatch "^Content-Length:\\s*(\\d+)") { $clen = [int]$Matches[1] } }',
+  '      $have = $ms.ToArray(); $ms.Dispose()',
+  '      $bodyTxt = ""',
+  '      if ($clen -gt 0) {',
+  '        $bm = New-Object System.IO.MemoryStream',
+  '        if ($have.Length -gt $headEnd) { $bm.Write($have, $headEnd, ([Math]::Min($have.Length, $headEnd + $clen) - $headEnd)) }',
+  '        while ($bm.Length -lt $clen) { $n = $ns.Read($buf, 0, $buf.Length); if ($n -le 0) { break }; $bm.Write($buf, 0, $n) }',
+  '        $bodyTxt = [Text.Encoding]::UTF8.GetString($bm.ToArray()); $bm.Dispose()',
+  '      }',
+  '      $lines = $headTxt -split "`r`n"',
+  '      $rl = $lines[0] -split " "',
+  '      $method = $rl[0]; $path = $rl[1]',
+  '      $key = ""',
+  '      foreach ($line in $lines) { if ($line -imatch "^X-Dsh-Key:\\s*(.+)") { $key = $Matches[1].Trim() } }',
+  '      $lastReq = Get-Date',
+  '      if ($DKey -and $key -ne $DKey) { D-SendJson $ns 401 "Unauthorized" @{ error = "bad key" }; continue }',
+  '      $idle = [DG]::IdleMs()',
+  "      if ($path -ne '/ping' -and $path -ne '/quit' -and $idle -lt $DGateIdle) {",
+  '        $ws = [math]::Max(0.3, [math]::Ceiling(($DGateIdle - $idle) / 100.0) / 10.0)',
+  '        D-SendJson $ns 423 "Locked" @{ error = "USER_CONTROL"; idleMs = [int]$idle; wait_seconds = $ws }',
+  '        continue',
+  '      }',
+  '      D-Handle $ns $method $path $bodyTxt',
+  '    } catch {',
+  '      try { D-SendJson $ns 500 "Error" @{ error = ("daemon: " + $_.Exception.Message) } } catch {}',
+  '    } finally {',
+  '      if ($client) { try { $client.Close() } catch {} }',
+  '    }',
+  '  }',
+  '  try { $listener.Stop() } catch {}',
+  '} catch {',
+  "  try { [IO.File]::AppendAllText((Join-Path $ARTDIR 'dshgkd.log'), ((Get-Date -Format 's') + ' fatal: ' + $_.Exception.Message + \"`r`n\")) } catch {}",
+  '}',
 ].join('\n')
 
 function psScript(argsJson, body) {
@@ -390,6 +616,18 @@ export const Config = z.object({
       maxWaitMs: z.number().default(120000),
     })
     .default({}),
+  // Резидентный демон на Windows (горячий путь): микро-HTTP на 127.0.0.1, доступ через
+  // постоянный SSH-туннель. Убирает спавн PowerShell (~0.4 c на вызов) и scp для скринов.
+  // enabled:false — всегда ходить через windows-mcp (демон не используется вовсе).
+  daemon: z
+    .object({
+      enabled: z.boolean().default(true),
+      port: z.number().default(18742),
+      gateIdleMs: z.number().default(1500),
+      idleExitMin: z.number().default(15),
+      jpegQuality: z.number().default(80),
+    })
+    .default({}),
   cacheDir: z.string().default(''),
   // PNG 缩放：0 = 自动（截屏长边 > maxDim 时缩到 4K→50%、2.5K→75%），0<x<1 = 固定比例。
   // 大图既省 read_image 的 context，又大幅加快 host GPU 的视觉推理。
@@ -436,6 +674,7 @@ function normalizeConfig(c) {
   const m = (c && c.mcp) || {}
   const s = (c && c.ssh) || {}
   const g = (c && c.gate) || {}
+  const dm = (c && c.daemon) || {}
   const v = (c && c.vision) || {}
   const vh = v.host || {}
   const vs = v.server || {}
@@ -443,6 +682,7 @@ function normalizeConfig(c) {
     mcp: { url: pick(m.url, 'http://192.168.0.240:8000/mcp'), token: m.token || '' },
     ssh: { host: pick(s.host, '192.168.0.240'), user: pick(s.user, 'admin'), port: s.port || 22, keyPath: s.keyPath || '' },
     gate: { maxWaitMs: g.maxWaitMs || 120000 },
+    daemon: { enabled: dm.enabled === undefined ? true : !!dm.enabled, port: dm.port || 18742, gateIdleMs: dm.gateIdleMs === undefined ? 1500 : dm.gateIdleMs, idleExitMin: dm.idleExitMin || 15, jpegQuality: dm.jpegQuality || 80 },
     cacheDir: pick(c && c.cacheDir, join(tmpdir(), 'dsh-guikit-remote')),
     scale: c && typeof c.scale === 'number' && c.scale > 0 && c.scale < 1 ? c.scale : 0,
     maxDim: c && c.maxDim ? c.maxDim : 2000,
@@ -581,6 +821,7 @@ export async function apply(ctx, config) {
     argv.push(remote, localPath)
     const handle = subprocess.spawn({
       argv: argv,
+      cwd: tmpdir(),
       stdio: { stdin: 'ignore', stdout: { maxBytes: 65536 }, stderr: { maxBytes: 65536 } },
       graceMs: 3000,
       signal: signal,
@@ -610,6 +851,155 @@ export async function apply(ctx, config) {
     }
   }
 
+  // ---- 常驻守护进程客户端（热路径）-----------------------------------------------------------
+  // 见 DAEMON_PS 注释。生命周期：dEnsure 惰性拉起（读旧 key → 探活 → 需要时上传+启动+建隧道），
+  // 隧道是常驻 ssh -N 子进程；守护进程空闲自退后下次 dEnsure 重新拉起。任何 daemonDown 错误
+  // 都标 dDownUntil 冷却，调用方回退 windows-mcp 路径，用户无感。
+  const DM = cfg.daemon
+  let dKey = null, dTunnel = null, dDownUntil = 0, dBoot = null
+  async function sshExecLine(cmd, timeoutMs) {
+    const argv = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-p', String(cfg.ssh.port)]
+    if (cfg.ssh.keyPath) argv.push('-i', cfg.ssh.keyPath)
+    argv.push(cfg.ssh.user + '@' + cfg.ssh.host, cmd)
+    const handle = subprocess.spawn({ argv, cwd: tmpdir(), stdio: { stdin: 'ignore', stdout: { maxBytes: 65536 }, stderr: { maxBytes: 65536 } }, graceMs: 3000, signal: AbortSignal.timeout(timeoutMs || 10000) })
+    const out = await handle.done
+    return { exit: out.exitCode || 0, stdout: handle.collected.stdout ? handle.collected.stdout.readFrom(0).text : '' }
+  }
+  async function dPing(timeoutMs) {
+    try {
+      const res = await fetch('http://127.0.0.1:' + DM.port + '/ping', { headers: { 'X-Dsh-Key': dKey || '' }, signal: AbortSignal.timeout(timeoutMs || 700) })
+      if (!res.ok) return null
+      const j = await res.json().catch(() => null)
+      return j && j.ok ? j : null
+    } catch (e) { return null }
+  }
+  function dMarkDown() {
+    dDownUntil = Date.now() + 10000
+    if (dTunnel && dTunnel.handle) { try { if (dTunnel.handle.kill) dTunnel.handle.kill() } catch (e) { /* 已退出 */ } }
+    dTunnel = null
+  }
+  async function dTunnelEnsure() {
+    if (dTunnel) return
+    const argv = ['ssh', '-N', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15', '-o', 'StrictHostKeyChecking=accept-new', '-p', String(cfg.ssh.port)]
+    if (cfg.ssh.keyPath) argv.push('-i', cfg.ssh.keyPath)
+    argv.push('-L', DM.port + ':127.0.0.1:' + DM.port, cfg.ssh.user + '@' + cfg.ssh.host)
+    const handle = subprocess.spawn({ argv, cwd: tmpdir(), stdio: { stdin: 'ignore', stdout: { maxBytes: 4096 }, stderr: { maxBytes: 4096 } }, graceMs: 2000 })
+    dTunnel = { handle }
+    const drop = () => { if (dTunnel && dTunnel.handle === handle) dTunnel = null }
+    handle.done.then(drop, drop)
+  }
+  async function dCall(path, body, timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 15000) + cfg.gate.maxWaitMs
+    for (;;) {
+      let res
+      try {
+        res = await fetch('http://127.0.0.1:' + DM.port + path, {
+          method: body === undefined ? 'GET' : 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Dsh-Key': dKey || '' },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: AbortSignal.timeout(timeoutMs || 15000),
+        })
+      } catch (e) { const err = new Error('daemon unreachable: ' + e.message); err.daemonDown = true; throw err }
+      const j = await res.json().catch(() => ({}))
+      if (res.status === 401) { const err = new Error('daemon key mismatch'); err.daemonDown = true; throw err }
+      if (res.status === 423) {
+        const wait = Math.min(10000, Math.max(300, (Number(j.wait_seconds) || 1) * 1000))
+        if (Date.now() + wait > deadline) throw new Error('desktop-gate (daemon): the user is actively using the Windows machine; no idle window within ' + cfg.gate.maxWaitMs + 'ms.')
+        await sleep(wait)
+        continue
+      }
+      if (!res.ok) throw new Error('daemon ' + path + ' http ' + res.status + ': ' + JSON.stringify(j).slice(0, 200))
+      return j
+    }
+  }
+  async function uploadRemote(content, fname, signal) {
+    const b64 = Buffer.from(content, 'utf8').toString('base64')
+    const rid = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
+    const chunks = []
+    for (let i = 0; i < b64.length; i += CHUNK) chunks.push(b64.slice(i, i + CHUNK))
+    const prep = "$d = Join-Path $env:TEMP 'dsh-guikit-remote'; New-Item -ItemType Directory -Force -Path $d | Out-Null; $f = Join-Path $d 'up-" + rid + ".b64'; "
+    for (let i = 0; i < chunks.length; i++) {
+      const op = i === 0 ? 'WriteAllText' : 'AppendAllText'
+      const r = await callPowerShell(prep + '[IO.File]::' + op + '($f, \'' + chunks[i] + '\')', 60000, signal)
+      if (r.exitCode !== 0) throw new Error('daemon upload chunk ' + i + ': ' + r.stdout.slice(-200))
+    }
+    const fin = "$d = Join-Path $env:TEMP 'dsh-guikit-remote'; $b = Join-Path $d 'up-" + rid + ".b64'; $p = Join-Path $d '" + fname + "'; [IO.File]::WriteAllBytes($p, [byte[]](239,187,191) + [Convert]::FromBase64String([IO.File]::ReadAllText($b))); Remove-Item $b -ErrorAction SilentlyContinue; (Get-Item $p).Length"
+    const r2 = await callPowerShell(fin, 60000, signal)
+    if (r2.exitCode !== 0) throw new Error('daemon upload finalize: ' + r2.stdout.slice(-200))
+  }
+  async function dEnsure(signal) {
+    if (!DM.enabled) return false
+    if (Date.now() < dDownUntil) return false
+    if (dKey && (await dPing())) return true
+    if (dBoot) return dBoot
+    dBoot = (async () => {
+      try {
+        // 旧守护进程可能还活着（上一次 dsh 会话留下的）：SSH 读 key 文件（不碰桌面、无门控）。
+        if (!dKey) {
+          const k = await sshExecLine('type "%TEMP%\\dsh-guikit-remote\\dshgkd.key"', 8000)
+          if (k.exit === 0 && k.stdout.trim()) {
+            dKey = k.stdout.trim().replace(/^\uFEFF/, '')
+            if (await dPing(1200)) return true
+            dKey = null
+          }
+        }
+        dKey = randomUUID()
+        await uploadRemote(PRELUDE + '\n' + DAEMON_PS, 'dshgkd.ps1', signal)
+        const start = "$d = Join-Path $env:TEMP 'dsh-guikit-remote'; Remove-Item (Join-Path $d 'dshgkd.log') -ErrorAction SilentlyContinue; Start-Process powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File', (Join-Path $d 'dshgkd.ps1'), '" + DM.port + "', '" + dKey + "', '" + DM.idleExitMin + "', '" + DM.gateIdleMs + "') -WindowStyle Hidden; Start-Sleep -Milliseconds 400; if (Test-Path (Join-Path $d 'dshgkd.log')) { Get-Content (Join-Path $d 'dshgkd.log') -Tail 3 } else { 'started' }"
+        await runPs(start, signal, 20000)
+        await dTunnelEnsure()
+        for (let i = 0; i < 30; i++) {
+          if (await dPing(900)) { dDownUntil = 0; return true }
+          await sleep(400, signal)
+        }
+        if (process.env.DSH_GUIKIT_DEBUG) console.error('[daemon] ping timeout after bootstrap')
+        dMarkDown()
+        return false
+      } catch (e) {
+        if (process.env.DSH_GUIKIT_DEBUG) console.error('[daemon] bootstrap failed: ' + (e && e.message))
+        dMarkDown()
+        return false
+      } finally { dBoot = null }
+    })()
+    return dBoot
+  }
+  function saveShotB64(j, prefix) {
+    const ext = j.fmt === 'jpg' ? 'jpg' : 'png'
+    const name = prefix + '-' + Date.now() + '.' + ext
+    let localPath = join(CACHE, name)
+    let n = 0
+    while (existsSync(localPath)) { n += 1; localPath = join(CACHE, name.replace(/\.(png|jpg)$/, '-' + n + '.$1')) }
+    writeFileSync(localPath, Buffer.from(j.b64, 'base64'))
+    return localPath
+  }
+  function actPayload(p, args) {
+    if (args.shot) p.shot = { fmt: 'jpg', q: DM.jpegQuality, maxDim: cfg.maxDim }
+    if (typeof args.settleMs === 'number') p.settleMs = Math.max(0, Math.min(3000, args.settleMs))
+    else if (args.shot) p.settleMs = 250
+    return p
+  }
+  async function actViaDaemon(p, prefix) {
+    const j = await dCall('/act', p, 20000)
+    if (j.error) throw new Error(String(j.error))
+    const v = { result: j.result, cursor: j.cursor, fg: j.fg, via: 'daemon' }
+    if (j.shot) v.path = saveShotB64(j.shot, prefix)
+    return v
+  }
+
+  function addDelivery(value, vres, viaDaemon) {
+    // sent 恒 true（事件确实送进了 OS）；verified 只认工具内 verify 断言的 satisfied ——
+    // 三态里只有 satisfied 是「已生效」的证据，unsatisfied / unknown 都保持 false。
+    value.delivery = {
+      sent: true,
+      verified: !!(vres && vres.verdict === 'satisfied'),
+      note: vres
+        ? 'Input was SENT; the in-call verify assertion returned verdict=' + vres.verdict + ' (only satisfied counts as verified).'
+        : viaDaemon
+          ? 'Input was SENT via the resident daemon (fast path): the events reached the OS, which does not mean the target reacted. Confirm with gui_verify (element/window) or gui_wait (pixel) before trusting this result.'
+          : 'Input was SENT, not confirmed: the events reached the OS, which does not mean the target reacted. Confirm with gui_verify (element/window) or gui_wait (pixel) before trusting this result.',
+    }
+  }
+
   function registerGuiTool(def, build, timeoutMs) {
     ctx.tools.register(defineTool({
       name: def.name,
@@ -621,24 +1011,27 @@ export async function apply(ctx, config) {
       },
       timeoutMs: timeoutMs + cfg.gate.maxWaitMs,
       execute: async (args, exec) => {
+        // 热路径：守护进程可用且该工具实现了 def.daemon → 一次 HTTP 完成；返回 null 表示
+        // 参数超出守护进程能力（verify/window-local/annotate 等）→ 回退 MCP 路径。
+        if (def.daemon && (await dEnsure(exec.signal))) {
+          try {
+            const dv = await def.daemon(args, exec)
+            if (dv) {
+              if (INPUT_EFFECT_TOOLS.has(def.name)) addDelivery(dv, null, true)
+              return dv
+            }
+          } catch (e) {
+            if (e && e.daemonDown) dMarkDown()
+            else throw e
+          }
+        }
         const built = build(args)
         const run = await runPs(psScript(built.json, built.body), exec.signal, timeoutMs)
         if (run.timedOut) throw new Error(def.name + ' timed out after ' + timeoutMs + 'ms')
         const value = jsonOut(run, def.name)
         if (value && value.error) throw new Error(String(value.error))
         if (PNG_ARTIFACT_TOOLS.has(def.name)) await fetchArtifact(value, exec.signal)
-        if (INPUT_EFFECT_TOOLS.has(def.name) && value !== null && typeof value === 'object') {
-          // sent 恒 true（事件确实送进了 OS）；verified 只认工具内 verify 断言的 satisfied ——
-          // 三态里只有 satisfied 是「已生效」的证据，unsatisfied / unknown 都保持 false。
-          const vres = value.verify
-          value.delivery = {
-            sent: true,
-            verified: !!(vres && vres.verdict === 'satisfied'),
-            note: vres
-              ? 'Input was SENT; the in-call verify assertion returned verdict=' + vres.verdict + ' (only satisfied counts as verified).'
-              : 'Input was SENT, not confirmed: the events reached the OS, which does not mean the target reacted. Confirm with gui_verify (element/window) or gui_wait (pixel) before trusting this result.',
-          }
-        }
+        if (INPUT_EFFECT_TOOLS.has(def.name) && value !== null && typeof value === 'object') addDelivery(value, value.verify)
         return value
       },
     }))
@@ -681,6 +1074,16 @@ export async function apply(ctx, config) {
       h: { type: 'number', description: 'Region height' },
       annotate: { type: 'boolean', description: 'Draw coordinate grid + cursor crosshair onto the image' },
       step: { type: 'number', description: 'Grid spacing px. Auto by region size: 25 for small zoom-ins (min side <300), 50 for <700, else 120; auto-coarsens to 240 for huge regions. Pass explicitly to override (min 20).' },
+    },
+    daemon: async (args) => {
+      if (args.annotate) return null
+      const p = { fmt: 'png', maxDim: cfg.maxDim }
+      if (typeof args.screen === 'number') p.screen = args.screen
+      else if (typeof args.x === 'number' && typeof args.y === 'number') { p.x = args.x; p.y = args.y; p.w = args.w; p.h = args.h }
+      const j = await dCall('/shot', p, 20000)
+      if (j.error) throw new Error(String(j.error))
+      const path = saveShotB64(j, 'screen')
+      return { path, x: j.x, y: j.y, w: j.w, h: j.h, out_w: j.out_w, out_h: j.out_h, scale: j.scale, space: 'virtual-desktop-physical', via: 'daemon' }
     },
   }, (args) => ({ json: JSON.stringify(args), body: [
     '$b = $null',
@@ -776,6 +1179,17 @@ export async function apply(ctx, config) {
       handle: { type: 'number', description: 'Window handle from gui_window list' },
       annotate: { type: 'boolean', description: 'Draw the coordinate grid onto the image' },
       step: { type: 'number', description: 'Grid spacing px (default 120)' },
+    },
+    daemon: async (args) => {
+      if (args.annotate) return null
+      const p = { fmt: 'png', maxDim: cfg.maxDim }
+      if (typeof args.handle === 'number') p.handle = args.handle
+      else if (typeof args.window === 'string') p.window = args.window
+      else return null
+      const j = await dCall('/shot', p, 20000)
+      if (j.error) throw new Error(String(j.error))
+      const path = saveShotB64(j, 'window')
+      return { path, x: j.x, y: j.y, w: j.w, h: j.h, out_w: j.out_w, out_h: j.out_h, scale: j.scale, space: 'window-local', via: 'daemon' }
     },
   }, (args) => {
     if (typeof args.handle !== 'number' && typeof args.window !== 'string') throw new Error('gui_window_shot needs window or handle')
@@ -893,6 +1307,13 @@ export async function apply(ctx, config) {
           intervalMs: { type: 'number', description: 'Poll interval (default 250, min 80)' },
         },
       },
+      settleMs: { type: 'number', description: 'Wait N ms after the action before returning (0-3000). Lets the UI settle before an optional shot.' },
+      shot: { type: 'boolean', description: 'Capture a full-desktop JPEG in the SAME call (after settleMs) and return its local path in .path - saves a whole round-trip.' },
+    },
+    daemon: async (args) => {
+      if (args.verify !== undefined || args.space === 'window-local') return null
+      const p = actPayload({ op: 'click', x: Math.round(args.x), y: Math.round(args.y), button: args.button || 'left', clicks: Math.max(1, Math.min(3, args.clicks || 1)) }, args)
+      return actViaDaemon(p, 'click')
     },
   }, (args) => {
     if (typeof args.x !== 'number' || typeof args.y !== 'number') throw new Error('gui_click needs numeric x and y')
@@ -936,6 +1357,13 @@ export async function apply(ctx, config) {
       stepDelayMs: { type: 'number', description: 'Delay per step in ms (default 16, max 250)' },
       window: { oneOf: [{ type: 'string' }, { type: 'number' }], description: 'Per-call target: window title substring, or a handle from gui_window. Required when space=window-local; when given it is also used for the insideWindow check.' },
       space: { type: 'string', description: 'virtual-desktop (default) | window-local (all four coordinates are gui_window_shot image pixels).' },
+      settleMs: { type: 'number', description: 'Wait N ms after the action before returning (0-3000). Lets the UI settle before an optional shot.' },
+      shot: { type: 'boolean', description: 'Capture a full-desktop JPEG in the SAME call (after settleMs) and return its local path in .path - saves a whole round-trip.' },
+    },
+    daemon: async (args) => {
+      if (args.space === 'window-local') return null
+      const p = actPayload({ op: 'drag', fx: Math.round(args.fromX), fy: Math.round(args.fromY), tx: Math.round(args.toX), ty: Math.round(args.toY), button: args.button || 'left', steps: args.steps || 16, stepDelayMs: args.stepDelayMs || 16 }, args)
+      return actViaDaemon(p, 'drag')
     },
   }, (args) => {
     for (const k of ['fromX', 'fromY', 'toX', 'toY']) {
@@ -975,6 +1403,17 @@ export async function apply(ctx, config) {
       mode: { type: 'string', description: 'unicode (default) | clipboard' },
       x: { type: 'number', description: 'Optional click-first X' },
       y: { type: 'number', description: 'Optional click-first Y' },
+      settleMs: { type: 'number', description: 'Wait N ms after typing before returning (0-3000). Lets the UI settle before an optional shot.' },
+      shot: { type: 'boolean', description: 'Capture a full-desktop JPEG in the SAME call (after settleMs) and return its local path in .path - saves a whole round-trip.' },
+    },
+    daemon: async (args) => {
+      if (args.mode === 'clipboard') return null
+      if (typeof args.x === 'number' && typeof args.y === 'number') {
+        const c = await dCall('/act', { op: 'click', x: Math.round(args.x), y: Math.round(args.y), button: 'left', clicks: 1 }, 15000)
+        if (c.error) throw new Error(String(c.error))
+      }
+      const p = actPayload({ op: 'type', text: String(args.text) }, args)
+      return actViaDaemon(p, 'type')
     },
   }, (args) => {
     if (typeof args.text !== 'string' || args.text.length === 0) throw new Error('gui_type needs non-empty text')
@@ -1002,6 +1441,12 @@ export async function apply(ctx, config) {
     description: 'Press a key or chord on the REAL keyboard, e.g. "enter", "ctrl+s", "alt+f4", "ctrl+shift+tab", "win", "printscreen". Lands on the focused window. Supported: modifiers ctrl/alt/shift/win, f1-f24, a-z, 0-9, enter/tab/esc/space/backspace/delete/insert/home/end/pgup/pgdn/arrows/printscreen.',
     parameters: {
       keys: { type: 'string', required: true, description: 'Key chord like ctrl+s or enter' },
+      settleMs: { type: 'number', description: 'Wait N ms after the keypress before returning (0-3000). Lets the UI settle before an optional shot.' },
+      shot: { type: 'boolean', description: 'Capture a full-desktop JPEG in the SAME call (after settleMs) and return its local path in .path - saves a whole round-trip.' },
+    },
+    daemon: async (args) => {
+      const p = actPayload({ op: 'key', vks: parseKeySpec(String(args.keys || '')) }, args)
+      return actViaDaemon(p, 'key')
     },
   }, (args) => {
     const vks = parseKeySpec(args.keys)
@@ -1020,6 +1465,13 @@ export async function apply(ctx, config) {
       y: { type: 'number', required: true, description: 'Cursor Y before scrolling' },
       direction: { type: 'string', description: 'up (default) | down | left | right' },
       notches: { type: 'number', description: 'Detents to scroll (default 3)' },
+      settleMs: { type: 'number', description: 'Wait N ms after scrolling before returning (0-3000). Lets the UI settle before an optional shot.' },
+      shot: { type: 'boolean', description: 'Capture a full-desktop JPEG in the SAME call (after settleMs) and return its local path in .path - saves a whole round-trip.' },
+    },
+    daemon: async (args) => {
+      const dir = ['up', 'down', 'left', 'right'].indexOf(String(args.direction)) >= 0 ? String(args.direction) : 'up'
+      const p = actPayload({ op: 'scroll', x: Math.round(args.x), y: Math.round(args.y), direction: dir, notches: Math.max(1, Math.min(20, args.notches || 3)) }, args)
+      return actViaDaemon(p, 'scroll')
     },
   }, (args) => {
     if (typeof args.x !== 'number' || typeof args.y !== 'number') throw new Error('gui_scroll needs numeric x and y')
@@ -1102,6 +1554,26 @@ export async function apply(ctx, config) {
       b: { type: 'number', description: 'eq/neq: blue' },
       timeoutMs: { type: 'number', description: 'Default 10000, cap 55000' },
       intervalMs: { type: 'number', description: 'Default 250' },
+    },
+    daemon: async (args) => {
+      const mode = String(args.mode || '')
+      if (mode !== 'pixel' && mode !== 'window') return null
+      const p = { mode }
+      if (mode === 'pixel') {
+        if (typeof args.x !== 'number' || typeof args.y !== 'number') return null
+        p.x = args.x; p.y = args.y
+        if (args.compare === 'eq' || args.compare === 'neq') {
+          if (typeof args.r !== 'number' || typeof args.g !== 'number' || typeof args.b !== 'number') return null
+          p.compare = args.compare; p.r = args.r; p.g = args.g; p.b = args.b
+        }
+      } else {
+        if (!args.title) return null
+        p.title = String(args.title)
+      }
+      if (typeof args.timeoutMs === 'number') p.timeoutMs = Math.min(55000, args.timeoutMs)
+      if (typeof args.intervalMs === 'number') p.intervalMs = Math.max(80, args.intervalMs)
+      const j = await dCall('/wait', p, (p.timeoutMs || 10000) + 8000)
+      return { met: j.met, elapsedMs: j.elapsedMs, detail: j.detail, observed: j.observed, via: 'daemon' }
     },
   }, (args) => {
     const mode = String(args.mode || '')
@@ -1656,11 +2128,24 @@ export async function apply(ctx, config) {
       }
       payload.maxDim = cfg.maxDim
       if (cfg.scale > 0) payload.scale = cfg.scale
-      const run = await runPs(psScript(JSON.stringify(payload), VISION_CAPTURE_PS), exec.signal, 25000)
-      const shot = jsonOut(run, 'gui_vision')
-      if (shot && shot.error) throw new Error(String(shot.error))
-      await fetchArtifact(shot, exec.signal)
-      const b64 = readFileSync(shot.path).toString('base64')
+      // 热路径：守护进程一次调用直接回 base64（JPEG 体积远小于 PNG，省掉 scp 与文件往返）。
+      let b64 = null, shot = null
+      if (await dEnsure(exec.signal)) {
+        try {
+          const sp = Object.assign({}, payload, { fmt: 'jpg', q: DM.jpegQuality })
+          const j = await dCall('/shot', sp, 25000)
+          if (j.error) throw new Error(String(j.error))
+          b64 = j.b64
+          shot = { path: saveShotB64(j, 'vision'), remote_path: null, space: (payload.window !== undefined || payload.handle !== undefined) ? 'window-local' : 'virtual-desktop-physical', scale: j.scale }
+        } catch (e) { if (e && e.daemonDown) dMarkDown(); else throw e }
+      }
+      if (!b64) {
+        const run = await runPs(psScript(JSON.stringify(payload), VISION_CAPTURE_PS), exec.signal, 25000)
+        shot = jsonOut(run, 'gui_vision')
+        if (shot && shot.error) throw new Error(String(shot.error))
+        await fetchArtifact(shot, exec.signal)
+        b64 = readFileSync(shot.path).toString('base64')
+      }
       const gpu = args.gpu === 'host' || args.gpu === 'server' ? args.gpu : cfg.vision.gpu
       const backend = gpu === 'server' ? cfg.vision.server : cfg.vision.host
       if (gpu === 'server' && cfg.vision.server.manage) await ensureServerModel(cfg.vision.server, exec.signal)

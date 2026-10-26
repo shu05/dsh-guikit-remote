@@ -1,6 +1,6 @@
 # dsh-guikit-remote
 
-**EN.** Windows desktop control for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) when dsh itself runs on *another* machine (e.g. a Linux server). The 15 `gui_*` tools execute on the remote Windows box through the [windows-mcp](https://github.com/CursorTouch/Windows-MCP) PowerShell channel (streamable-http MCP), screenshots are pulled back over scp, and `gui_vision` answers questions about the screen using the GPU of the **host** (the controlled Windows machine) or the **server** (the machine running dsh).
+**EN.** Windows desktop control for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) when dsh itself runs on *another* machine (e.g. a Linux server). The 15 `gui_*` tools execute on the remote Windows box through the [windows-mcp](https://github.com/CursorTouch/Windows-MCP) PowerShell channel (streamable-http MCP), screenshots are pulled back over scp, and `gui_vision` answers questions about the screen using the GPU of the **host** (the controlled Windows machine) or the **server** (the machine running dsh). For near-real-time speed the plugin also runs a **resident micro-server on Windows** reached through a persistent SSH tunnel — no per-call PowerShell spawn, screenshots inline as base64, and click/key + auto-screenshot in a single round trip (see *Скорость*); any daemon hiccup transparently falls back to windows-mcp.
 
 **RU.** Плагин удалённого управления рабочим столом Windows для dsh, когда сам dsh живёт на другой машине (например на Linux-сервере). Скрипты тулзов выполняются на Windows через windows-mcp (единственный канал, сидящий в интерактивной сессии), скриншоты забираются по scp, а `gui_vision` отвечает на вопросы о экране видеокартой хоста (управляемая Windows) или сервера (машина с dsh) — по переключателю в конфиге.
 
@@ -18,6 +18,7 @@ dsh (Linux/сервер)                         Windows-машина (упра�
 │ dsh-guikit-remote    │ ──── PowerShell tool ──────────► │ windows-mcp (интерактив. │
 │  gui_* тулзы         │                                  │  сессия): SendInput, UIA,│
 │                      │ ◄─── stdout JSON / exit code ─── │  PrintWindow, скриншоты  │
+│                      │                                  └──────────────────────────┘
 │  gui_screenshot      │ ──── scp (SSH, файлы) ─────────►  %TEMP%\dsh-guikit\*.png
 │  gui_vision          │ ──── OpenAI-compatible ────────►  ollama (GPU хоста) или
 └──────────────────────┘        /chat/completions          ollama+strata (GPU сервера)
@@ -58,7 +59,12 @@ dsh (Linux/сервер)                         Windows-машина (упра�
 | `mcp.token` | `process.env.WIN_MCP_KEY` | auth-ключ windows-mcp |
 | `ssh.host` / `.user` / `.port` | — / admin / 22 | scp-канал для скриншотов |
 | `gate.maxWaitMs` | 120000 | сколько ждать desktop-gate'а, пока пользователь освободит мышь/клавиату |
-| `vision.gpu` | `server` | какая видеокарта крутит `gui_vision`: `host` (Windows) или `server` (машина с dsh) |
+| `daemon.enabled` | `true` | резидентный микро-сервер на Windows (см. «Скорость»); `false` — всё через windows-mcp |
+| `daemon.port` | 18742 | порт демона на `127.0.0.1` (доступ только через SSH-туннель, файрвол не трогается) |
+| `daemon.gateIdleMs` | 1500 | простой мыши/клавиатуры, после которого демон принимает ввод |
+| `daemon.idleExitMin` | 15 | минут простоя до самовыхода демона (следующий вызов поднимет его заново) |
+| `daemon.jpegQuality` | 80 | качество JPEG для inline-скринов `/act` и `gui_vision` |
+| `vision.gpu` | `host` | какая видеокарта крутит `gui_vision`: `host` (Windows) или `server` (машина с dsh) |
 | `vision.host.baseUrl/model` | `http://<win>:11434/v1` / `qwen3-vl:2b-instruct` | OpenAI-compatible endpoint ollama на Windows |
 | `vision.server.baseUrl/model` | `http://127.0.0.1:11434/v1` / `qwen3-vl:2b-instruct` | endpoint ollama на сервере |
 | `vision.server.manage` | `true` | загружать/выгружать модель по требованию |
@@ -68,6 +74,33 @@ dsh (Linux/сервер)                         Windows-машина (упра�
 | `scale` / `maxDim` | 0 (авто) / 2000 | даунскейл скриншотов для vision-контекста |
 
 Полное руководство по установке и настройке — **[docs/INSTALL.md](docs/INSTALL.md)**.
+
+## Скорость (резидентный демон)
+
+Каждый вызов через windows-mcp — это спавн PowerShell (~0.4 с) + scp-возврат скриншота
+(~1 с): на скриншот уходит ~2 с, на клик со скриншотом — два таких往返. Чтобы приблизиться
+к реальному времени, плагин поднимает на Windows **резидентный микро-HTTP-сервер** (демон):
+
+- демон — PowerShell-скрипт, который плагин один раз загружает и запускает **через сам
+  windows-mcp** (чтобы процесс попал в интерактивную сессию и видел рабочий стол), а дальше
+  ходит к нему по **постоянному `ssh -N -L` туннелю** на `127.0.0.1:18742`;
+- маршруты `GET /ping`, `POST /shot` (full/region/window, PNG|JPEG, даунскейл, base64 в
+  ответе — scp не нужен), `POST /act` (click/drag/scroll/type/key/move/activate + `settleMs`
+  + **inline-скриншот в том же ответе**), `POST /wait` (пиксель/окно, поллинг внутри демона),
+  `POST /quit`;
+- desktop-gate перенесён в демона (`GetLastInputInfo`): пока пользователь у машины — `423
+  USER_CONTROL`, хост ждёт `wait_seconds` и повторяет;
+- ключ доступа — GUID, лежит в `%TEMP%\dsh-guikit-remote\dshgkd.key`; демон привязан к
+  `127.0.0.1`, файрвол не менялся; при простое `idleExitMin` минут выходит, следующий вызов
+  поднимает его заново;
+- **любой сбой демона прозрачно откатывает вызов на windows-mcp-путь** — пользователь не
+  замечает разницы, кроме скорости.
+
+Замерено на живой машине (RTX 3060, 4K-десктоп, туннель через gbit): `/shot` всего экрана
+с даунскейлом до 2000px и JPEG-кодированием — **0.45 с** сквозной; `/act` клик с inline-скрином —
+**0.41 с** одним往返 (было ~2 с и ~4 с соответственно). У `gui_click`/`gui_key`/`gui_type`/
+`gui_scroll`/`gui_drag` появились параметры `settleMs` и `shot:true` — действие и скриншот
+приходят в одном вызове.
 
 ## Быстрый старт
 
